@@ -1,0 +1,6 @@
+/_build/
+/deps/
+/output/
+*.ez
+*.beam
+/hxh_pdf
