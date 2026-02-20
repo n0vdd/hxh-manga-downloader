@@ -25,11 +25,15 @@ mix dialyzer              # Static type analysis
 
 ## Architecture
 
-Two modules in `lib/hxh_pdf/`:
+Four modules:
 
-- **`hxh_pdf.ex`** — Entry point (`main/1`), argument parsing, scraping, downloading, and CBZ creation. Processes up to 3 chapters concurrently via `Task.async_stream`, each downloading up to 4 images concurrently. Uses Req for HTTP (with 3 retries, 60s timeout) and Floki for HTML parsing.
+- **`hxh_pdf.ex`** — Entry point (`main/1`), argument parsing, scraping, image downloading, and CBZ creation. Processes up to 3 chapters concurrently via `Task.async`, each downloading up to 8 images concurrently via `Task.async_stream`. Uses Floki for HTML parsing.
 
-- **`rate_limiter.ex`** — GenServer enforcing 5 requests/second across all concurrent tasks. Called before each HTTP request.
+- **`http.ex`** — HTTP client wrapping Req + Finch. Every request goes through FlowControl gating, with automatic retries and exponential backoff.
+
+- **`flow_control.ex`** — GenServer acting as an adaptive permit semaphore. Permits increase after sustained success and decrease on errors, keeping downstream pressure in check.
+
+- **`shutdown.ex`** — Lock-free graceful shutdown flag using `:atomics` + `:persistent_term`. SIGTERM flips the flag; `run_chapters` checks it to stop launching new work.
 
 **Pipeline:** `process_chapter` → check if CBZ exists (skip) → scrape image URLs from HTML → download images to temp dir → optionally optimize with ImageMagick → create CBZ via Erlang `:zip` → cleanup temp dir.
 
