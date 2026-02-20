@@ -1,10 +1,10 @@
 defmodule HxhPdf.FlowControl do
   use GenServer
 
-  @initial_permits 5
-  @min_permits 2
-  @max_permits 25
-  @increase_after 30
+  @initial_permits 10
+  @min_permits 3
+  @max_permits 30
+  @increase_after 20
   @cooldown_ms 3_000
   @log_interval_ms 30_000
 
@@ -62,7 +62,7 @@ defmodule HxhPdf.FlowControl do
        in_flight: 0,
        waiters: :queue.new(),
        streak: 0,
-       last_decrease: 0,
+       last_decrease: System.monotonic_time(:millisecond) - @cooldown_ms - 1,
        total_requests: 0,
        total_successes: 0,
        total_errors: 0,

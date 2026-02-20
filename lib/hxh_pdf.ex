@@ -14,6 +14,7 @@ defmodule HxhPdf do
   @output_dir "output"
   @last_chapter 412
   @max_chapter_concurrency 3
+  @progress_key {__MODULE__, :progress}
   @max_image_concurrency 8
   @scrape_max_retries 3
   @image_max_retries 5
@@ -54,66 +55,63 @@ defmodule HxhPdf do
     chapters = Enum.to_list(from..to)
     total = length(chapters)
 
+    counter = :counters.new(1, [:atomics])
+    :persistent_term.put(@progress_key, {counter, total})
+
     opt_label = if optimize?, do: ", optimized", else: ""
     IO.puts("Downloading chapters #{from}-#{to} as cbz (#{total} chapters#{opt_label})")
 
     start_time = System.monotonic_time(:millisecond)
 
-    run_chapters(chapters, optimize?, @max_chapter_concurrency)
+    run_chapters(chapters, optimize?, @max_chapter_concurrency, total)
 
     elapsed_s = (System.monotonic_time(:millisecond) - start_time) / 1_000
     print_summary(elapsed_s)
   end
 
-  defp run_chapters(chapters, optimize?, max_concurrency) do
-    run_chapters(chapters, optimize?, max_concurrency, %{})
+  defp run_chapters(chapters, optimize?, max_concurrency, total) do
+    chapters
+    |> Task.async_stream(
+      fn chapter -> timed_process_chapter(chapter, optimize?, total) end,
+      max_concurrency: max_concurrency,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.each(fn
+      {:ok, _result} -> :ok
+      {:exit, reason} -> IO.puts("[EXIT] Task crashed: #{inspect(reason)}")
+    end)
   end
 
-  defp run_chapters([], _optimize?, _max_concurrency, in_flight) when map_size(in_flight) == 0 do
-    :ok
-  end
-
-  defp run_chapters(remaining, optimize?, max_concurrency, in_flight) do
-    {to_launch, remaining} =
-      if HxhPdf.Shutdown.requested?() do
-        {[], remaining}
-      else
-        slots = max_concurrency - map_size(in_flight)
-        Enum.split(remaining, slots)
-      end
-
-    new_in_flight =
-      Enum.reduce(to_launch, in_flight, fn chapter, acc ->
-        task = Task.async(fn -> process_chapter(chapter, optimize?) end)
-        Map.put(acc, task.ref, task)
-      end)
-
-    if map_size(new_in_flight) == 0 do
-      if remaining != [] do
-        skipped = length(remaining)
-        IO.puts("[SHUTDOWN] Skipped #{skipped} remaining chapter(s)")
-      end
-
-      :ok
+  defp timed_process_chapter(chapter, optimize?, total) do
+    if HxhPdf.Shutdown.requested?() do
+      IO.puts("[SHUTDOWN] Skipping chapter #{chapter}")
+      {:skip_shutdown, chapter}
     else
-      receive do
-        {ref, result} when is_map_key(new_in_flight, ref) ->
-          Process.demonitor(ref, [:flush])
-          report_result(result)
-          run_chapters(remaining, optimize?, max_concurrency, Map.delete(new_in_flight, ref))
+      start = System.monotonic_time(:millisecond)
+      result = process_chapter(chapter, optimize?)
+      elapsed = (System.monotonic_time(:millisecond) - start) / 1_000
 
-        {:DOWN, ref, :process, _pid, reason} when is_map_key(new_in_flight, ref) ->
-          IO.puts("[EXIT] Task crashed: #{inspect(reason)}")
-          run_chapters(remaining, optimize?, max_concurrency, Map.delete(new_in_flight, ref))
-      end
+      {counter, ^total} = :persistent_term.get(@progress_key)
+      :counters.add(counter, 1, 1)
+      done = :counters.get(counter, 1)
+
+      report_result(result, elapsed, done, total)
+      result
     end
   end
 
-  defp report_result({:ok, chapter}), do: IO.puts("[OK] Chapter #{chapter}")
-  defp report_result({:skip, chapter}), do: IO.puts("[SKIP] Chapter #{chapter} (already exists)")
+  defp report_result({:ok, chapter}, elapsed, done, total),
+    do: IO.puts("[OK] Chapter #{chapter} in #{Float.round(elapsed, 1)}s (#{done}/#{total})")
 
-  defp report_result({:error, chapter, reason}),
-    do: IO.puts("[ERROR] Chapter #{chapter}: #{inspect(reason)}")
+  defp report_result({:skip, chapter}, _elapsed, done, total),
+    do: IO.puts("[SKIP] Chapter #{chapter} (already exists) (#{done}/#{total})")
+
+  defp report_result({:error, chapter, reason}, elapsed, done, total),
+    do:
+      IO.puts(
+        "[ERROR] Chapter #{chapter}: #{inspect(reason)} after #{Float.round(elapsed, 1)}s (#{done}/#{total})"
+      )
 
   defp print_summary(elapsed_s) do
     stats = HxhPdf.FlowControl.get_stats()
@@ -174,7 +172,7 @@ defmodule HxhPdf do
     with {:ok, %{status: 200, body: body}} <- HxhPdf.Http.get([url: url], @scrape_max_retries),
          {:ok, doc} <- Floki.parse_document(body) do
       case extract_image_urls(doc) do
-        [] -> {:error, "no images found for chapter #{chapter}"}
+        [] -> {:error, no_images_diagnostic(doc, chapter)}
         urls -> {:ok, urls}
       end
     else
@@ -197,6 +195,19 @@ defmodule HxhPdf do
       urls ->
         Enum.uniq(urls)
     end
+  end
+
+  defp no_images_diagnostic(doc, chapter) do
+    img_count = doc |> Floki.find("img") |> length()
+    a_count = doc |> Floki.find("a") |> length()
+
+    entry_html =
+      case Floki.find(doc, ".entry-content") do
+        [] -> "(no .entry-content found)"
+        nodes -> nodes |> Floki.raw_html() |> String.slice(0, 500)
+      end
+
+    "no images found for chapter #{chapter} | <img>: #{img_count}, <a>: #{a_count} | entry-content preview: #{entry_html}"
   end
 
   defp download_images(urls, tmp_dir, optimize?) do

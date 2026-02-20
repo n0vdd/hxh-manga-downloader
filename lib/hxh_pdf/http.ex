@@ -26,7 +26,7 @@ defmodule HxhPdf.Http do
   def start_pool do
     Finch.start_link(
       name: @finch_name,
-      pools: %{default: [size: 25, count: 1, conn_opts: [transport_opts: [timeout: 10_000]]]}
+      pools: %{default: [size: 30, count: 1, conn_opts: [transport_opts: [timeout: 10_000]]]}
     )
   end
 
