@@ -17,18 +17,16 @@ mix escript.build
 ## Usage
 
 ```bash
-# Download chapters 1 through 10
-./hxh_pdf --from 1 --to 10
-
-# Download without image optimization
-./hxh_pdf --from 50 --to 100 --no-optimize
+./hxh_pdf
 ```
 
-Output goes to `./output/` as `Hunter_x_Hunter_XXX.cbz`. Existing chapters are skipped automatically.
+Downloads all 412 chapters to `./output/` as `Hunter_x_Hunter_XXX.cbz`. Images are optimized with ImageMagick by default. Existing chapters are skipped automatically.
 
 ## Architecture
 
-Two modules:
+Four modules:
 
-- **`HxhPdf`** — Entry point, argument parsing, scraping, downloading, and CBZ creation. Processes up to 3 chapters concurrently, each downloading up to 4 images concurrently. Uses [Req](https://github.com/wojtekmach/req) for HTTP and [Floki](https://github.com/philss/floki) for HTML parsing.
-- **`HxhPdf.RateLimiter`** — GenServer enforcing 5 requests/second across all concurrent tasks.
+- **`HxhPdf`** — Entry point, argument parsing, scraping, image downloading, and CBZ creation. Processes up to 3 chapters concurrently, each downloading up to 8 images concurrently. Uses [Req](https://github.com/wojtekmach/req) for HTTP and [Floki](https://github.com/philss/floki) for HTML parsing.
+- **`HxhPdf.Http`** — HTTP client wrapping Req + Finch. Every request goes through FlowControl gating, with automatic retries and exponential backoff.
+- **`HxhPdf.FlowControl`** — GenServer acting as an adaptive permit semaphore. Permits increase after sustained success and decrease on errors, keeping downstream pressure in check.
+- **`HxhPdf.Shutdown`** — Lock-free graceful shutdown flag using `:atomics` + `:persistent_term`. SIGTERM flips the flag to stop launching new work.
