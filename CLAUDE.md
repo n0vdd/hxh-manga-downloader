@@ -13,6 +13,7 @@ mix deps.get              # Install dependencies
 mix escript.build         # Build the ./hxh_pdf binary
 ./hxh_pdf --from 1 --to 10               # Download chapters 1-10
 ./hxh_pdf --from 50 --to 100 --no-optimize  # Download without image optimization
+./hxh_pdf --from 1 --to 50 --chapters 2 --images 4  # Custom concurrency
 mix format                # Format code
 mix credo --strict        # Lint
 mix dialyzer              # Static type analysis
@@ -25,15 +26,9 @@ mix dialyzer              # Static type analysis
 
 ## Architecture
 
-Four modules:
+Single module:
 
-- **`hxh_pdf.ex`** — Entry point (`main/1`), argument parsing, scraping, image downloading, and CBZ creation. Processes up to 3 chapters concurrently via `Task.async`, each downloading up to 8 images concurrently via `Task.async_stream`. Uses Floki for HTML parsing.
-
-- **`http.ex`** — HTTP client wrapping Req + Finch. Every request goes through FlowControl gating, with automatic retries and exponential backoff.
-
-- **`flow_control.ex`** — GenServer acting as an adaptive permit semaphore. Permits increase after sustained success and decrease on errors, keeping downstream pressure in check.
-
-- **`shutdown.ex`** — Lock-free graceful shutdown flag using `:atomics` + `:persistent_term`. SIGTERM flips the flag; `run_chapters` checks it to stop launching new work.
+- **`hxh_pdf.ex`** — Entry point (`main/1`), argument parsing, scraping, image downloading, and CBZ creation. Processes chapters concurrently via `Task.async_stream` (default: 4 chapters, configurable via `--chapters`), each downloading images concurrently (default: 6, configurable via `--images`). Finch pool size scales to `chapters * images + chapters` (default: 28). Uses Floki for HTML parsing, Req + Finch for HTTP with transient retries.
 
 **Pipeline:** `process_chapter` → check if CBZ exists (skip) → scrape image URLs from HTML → download images to temp dir → optionally optimize with ImageMagick → create CBZ via Erlang `:zip` → cleanup temp dir.
 

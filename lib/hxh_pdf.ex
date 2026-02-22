@@ -13,11 +13,14 @@ defmodule HxhPdf do
   @base_url "https://w19.read-hxh.com/manga"
   @output_dir "output"
   @last_chapter 412
-  @max_chapter_concurrency 3
-  @progress_key {__MODULE__, :progress}
-  @max_image_concurrency 8
-  @scrape_max_retries 3
-  @image_max_retries 5
+  @default_chapters 4
+  @default_images 6
+  @finch_name HxhPdf.Finch
+
+  @headers [
+    {"user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"},
+    {"referer", "https://w19.read-hxh.com/"}
+  ]
 
   @doc """
   Entry point for the escript.
@@ -27,160 +30,142 @@ defmodule HxhPdf do
     * `--from N` — first chapter to download (default: 1)
     * `--to N` — last chapter to download (default: #{@last_chapter})
     * `--no-optimize` — skip ImageMagick grayscale/strip/quality reduction
+    * `--chapters N` — max concurrent chapters (default: #{@default_chapters})
+    * `--images N` — max concurrent image downloads per chapter (default: #{@default_images})
   """
   def main(args \\ System.argv()) do
     {opts, _, _} =
       OptionParser.parse(args,
-        strict: [from: :integer, to: :integer, no_optimize: :boolean]
+        strict: [
+          from: :integer,
+          to: :integer,
+          optimize: :boolean,
+          chapters: :integer,
+          images: :integer
+        ]
       )
 
     from = Keyword.get(opts, :from, 1)
     to = Keyword.get(opts, :to, @last_chapter)
-    optimize? = not Keyword.get(opts, :no_optimize, false)
+    optimize? = Keyword.get(opts, :optimize, true)
+    max_chapters = Keyword.get(opts, :chapters, @default_chapters)
+    max_images = Keyword.get(opts, :images, @default_images)
 
-    HxhPdf.Shutdown.init()
-
-    System.trap_signal(:sigterm, fn ->
-      IO.puts("\n[SHUTDOWN] SIGTERM received, finishing in-flight chapters...")
-      HxhPdf.Shutdown.request()
-    end)
-
-    HxhPdf.FlowControl.start_link([])
-    HxhPdf.Http.start_pool()
+    Finch.start_link(
+      name: @finch_name,
+      pools: %{
+        default: [
+          size: max_chapters * max_images + max_chapters,
+          count: System.schedulers_online(),
+          conn_opts: [transport_opts: [timeout: 15_000]]
+        ]
+      }
+    )
 
     File.mkdir_p!(@output_dir)
     cleanup_matching(System.tmp_dir!(), &String.starts_with?(&1, "hxh_ch"), &File.rm_rf/1)
     cleanup_matching(@output_dir, &String.ends_with?(&1, ".cbz.tmp"))
 
     chapters = Enum.to_list(from..to)
-    total = length(chapters)
-
-    counter = :counters.new(1, [:atomics])
-    :persistent_term.put(@progress_key, {counter, total})
+    {skipped, pending} = partition_chapters(chapters)
 
     opt_label = if optimize?, do: ", optimized", else: ""
-    IO.puts("Downloading chapters #{from}-#{to} as cbz (#{total} chapters#{opt_label})")
 
-    start_time = System.monotonic_time(:millisecond)
+    if skipped != [] do
+      IO.puts("[SKIP] #{length(skipped)} chapters already exist")
+    end
 
-    run_chapters(chapters, optimize?, @max_chapter_concurrency, total)
+    total = length(pending)
 
-    elapsed_s = (System.monotonic_time(:millisecond) - start_time) / 1_000
-    print_summary(elapsed_s)
-  end
-
-  defp run_chapters(chapters, optimize?, max_concurrency, total) do
-    chapters
-    |> Task.async_stream(
-      fn chapter -> timed_process_chapter(chapter, optimize?, total) end,
-      max_concurrency: max_concurrency,
-      ordered: false,
-      timeout: :infinity
-    )
-    |> Enum.each(fn
-      {:ok, _result} -> :ok
-      {:exit, reason} -> IO.puts("[EXIT] Task crashed: #{inspect(reason)}")
-    end)
-  end
-
-  defp timed_process_chapter(chapter, optimize?, total) do
-    if HxhPdf.Shutdown.requested?() do
-      IO.puts("[SHUTDOWN] Skipping chapter #{chapter}")
-      {:skip_shutdown, chapter}
+    if pending == [] do
+      IO.puts("Nothing to download.")
     else
-      start = System.monotonic_time(:millisecond)
-      result = process_chapter(chapter, optimize?)
-      elapsed = (System.monotonic_time(:millisecond) - start) / 1_000
+      IO.puts(
+        "Downloading #{total} chapters as cbz#{opt_label} (concurrency: #{max_chapters} chapters, #{max_images} images)"
+      )
 
-      {counter, ^total} = :persistent_term.get(@progress_key)
-      :counters.add(counter, 1, 1)
-      done = :counters.get(counter, 1)
+      start_time = System.monotonic_time(:millisecond)
 
-      report_result(result, elapsed, done, total)
-      result
+      run_chapters(pending, optimize?, total, max_chapters, max_images)
+
+      elapsed_s = (System.monotonic_time(:millisecond) - start_time) / 1_000
+      IO.puts("\nElapsed: #{Float.round(elapsed_s, 1)}s | Done!")
     end
   end
 
-  defp report_result({:ok, chapter}, elapsed, done, total),
+  defp run_chapters(chapters, optimize?, total, max_chapters, max_images) do
+    chapters
+    |> Task.async_stream(
+      fn chapter -> timed_process_chapter(chapter, optimize?, max_images) end,
+      max_concurrency: max_chapters,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.reduce(0, fn result, done ->
+      done = done + 1
+      report_result(result, done, total)
+      done
+    end)
+  end
+
+  defp timed_process_chapter(chapter, optimize?, max_images) do
+    start = System.monotonic_time(:millisecond)
+    result = process_chapter(chapter, optimize?, max_images)
+    elapsed = (System.monotonic_time(:millisecond) - start) / 1_000
+    {result, elapsed}
+  end
+
+  defp report_result({:ok, {{:ok, chapter}, elapsed}}, done, total),
     do: IO.puts("[OK] Chapter #{chapter} in #{Float.round(elapsed, 1)}s (#{done}/#{total})")
 
-  defp report_result({:skip, chapter}, _elapsed, done, total),
-    do: IO.puts("[SKIP] Chapter #{chapter} (already exists) (#{done}/#{total})")
-
-  defp report_result({:error, chapter, reason}, elapsed, done, total),
+  defp report_result({:ok, {{:error, chapter, reason}, elapsed}}, done, total),
     do:
       IO.puts(
         "[ERROR] Chapter #{chapter}: #{inspect(reason)} after #{Float.round(elapsed, 1)}s (#{done}/#{total})"
       )
 
-  defp print_summary(elapsed_s) do
-    stats = HxhPdf.FlowControl.get_stats()
+  defp report_result({:exit, reason}, done, total),
+    do: IO.puts("[EXIT] Task crashed: #{inspect(reason)} (#{done}/#{total})")
 
-    throughput =
-      if elapsed_s > 0,
-        do: Float.round(stats.total_requests / elapsed_s, 1),
-        else: 0.0
-
-    IO.puts("""
-
-    --- Summary ---
-    Total requests: #{stats.total_requests} (#{stats.total_successes} ok, #{stats.total_errors} errors)
-    Permit range: #{stats.min_permits_seen}-#{stats.peak_permits} (final: #{stats.current_permits})
-    Adjustments: +#{stats.permit_increases} / -#{stats.permit_decreases}
-    Waits: #{stats.total_waits}
-    Elapsed: #{Float.round(elapsed_s, 1)}s | Throughput: #{throughput} req/s
-    Done!\
-    """)
+  defp partition_chapters(chapters) do
+    {skipped, pending} = Enum.split_with(chapters, &File.exists?(output_path(&1)))
+    {skipped, pending}
   end
 
-  defp process_chapter(chapter, optimize?) do
+  defp process_chapter(chapter, optimize?, max_images) do
     output_file = output_path(chapter)
 
-    if File.exists?(output_file) do
-      {:skip, chapter}
-    else
-      tmp_dir =
-        Path.join(System.tmp_dir!(), "hxh_ch#{chapter}_#{System.unique_integer([:positive])}")
+    tmp_dir =
+      Path.join(System.tmp_dir!(), "hxh_ch#{chapter}_#{System.unique_integer([:positive])}")
 
-      File.mkdir_p!(tmp_dir)
+    File.mkdir_p!(tmp_dir)
 
-      try do
-        with {:ok, image_urls} <- scrape_chapter(chapter),
-             :ok <- download_images(image_urls, tmp_dir, optimize?),
-             :ok <- create_archive(tmp_dir, output_file) do
-          {:ok, chapter}
-        else
-          {:error, reason} -> {:error, chapter, reason}
-        end
-      after
-        File.rm_rf!(tmp_dir)
+    try do
+      with {:ok, image_urls} <- scrape_chapter(chapter),
+           :ok <- download_images(image_urls, tmp_dir, max_images),
+           :ok <- maybe_optimize(tmp_dir, optimize?),
+           :ok <- create_archive(tmp_dir, output_file) do
+        {:ok, chapter}
+      else
+        {:error, reason} -> {:error, chapter, reason}
       end
+    after
+      File.rm_rf!(tmp_dir)
     end
-  end
-
-  defp chapter_url(407), do: "#{@base_url}/hunter-x-hunter-chapter-407-2/"
-  defp chapter_url(n), do: "#{@base_url}/hunter-x-hunter-chapter-#{n}/"
-
-  defp output_path(chapter) do
-    padded = chapter |> Integer.to_string() |> String.pad_leading(3, "0")
-    Path.join(@output_dir, "Hunter_x_Hunter_#{padded}.cbz")
   end
 
   defp scrape_chapter(chapter) do
     url = chapter_url(chapter)
 
-    with {:ok, %{status: 200, body: body}} <- HxhPdf.Http.get([url: url], @scrape_max_retries),
+    with {:ok, %{status: 200, body: body}} <- http_get(url: url, max_retries: 3),
          {:ok, doc} <- Floki.parse_document(body) do
       case extract_image_urls(doc) do
         [] -> {:error, no_images_diagnostic(doc, chapter)}
         urls -> {:ok, urls}
       end
     else
-      {:ok, %{status: status}} ->
-        {:error, "HTTP #{status} for #{url}"}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:ok, %{status: status}} -> {:error, "HTTP #{status} for #{url}"}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -210,58 +195,69 @@ defmodule HxhPdf do
     "no images found for chapter #{chapter} | <img>: #{img_count}, <a>: #{a_count} | entry-content preview: #{entry_html}"
   end
 
-  defp download_images(urls, tmp_dir, optimize?) do
+  defp download_images(urls, tmp_dir, max_images) do
     urls
     |> Enum.with_index(1)
-    |> Task.async_stream(&download_one(&1, tmp_dir, optimize?),
-      max_concurrency: @max_image_concurrency,
+    |> Task.async_stream(&download_one(&1, tmp_dir),
+      max_concurrency: max_images,
       timeout: :infinity
     )
-    |> Enum.to_list()
-    |> check_results()
-  end
-
-  defp download_one({url, idx}, tmp_dir, optimize?) do
-    padded = idx |> Integer.to_string() |> String.pad_leading(3, "0")
-    ext = url_extension(url)
-    dest = Path.join(tmp_dir, "#{padded}#{ext}")
-
-    with :ok <- download_image(url, dest) do
-      if optimize?, do: optimize_image(dest), else: :ok
-    end
-  end
-
-  defp check_results(results) do
-    Enum.reduce_while(results, :ok, fn
+    |> Enum.reduce_while(:ok, fn
       {:exit, reason}, _acc -> {:halt, {:error, "download task crashed: #{inspect(reason)}"}}
       {:ok, :ok}, acc -> {:cont, acc}
       {:ok, {:error, reason}}, _acc -> {:halt, {:error, reason}}
     end)
   end
 
-  defp url_extension(url) do
-    uri = URI.parse(url)
-
-    case Path.extname(uri.path || "") do
-      "" -> ".jpg"
-      ext -> ext
-    end
+  defp download_one({url, idx}, tmp_dir) do
+    padded = idx |> Integer.to_string() |> String.pad_leading(3, "0")
+    ext = url_extension(url)
+    dest = Path.join(tmp_dir, "#{padded}#{ext}")
+    download_image(url, dest)
   end
 
   defp download_image(url, dest) do
-    case HxhPdf.Http.get([url: url, into: File.stream!(dest)], @image_max_retries) do
-      {:ok, %{status: 200}} -> :ok
-      {:ok, %{status: status}} -> {:error, "HTTP #{status} downloading #{url}"}
-      {:error, reason} -> {:error, reason}
+    case http_get(url: url, max_retries: 5) do
+      {:ok, %{status: 200, body: body}} ->
+        File.write!(dest, body)
+        :ok
+
+      {:ok, %{status: status}} ->
+        {:error, "HTTP #{status} downloading #{url}"}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp optimize_image(path) do
-    case System.cmd("magick", [path, "-colorspace", "Gray", "-strip", "-quality", "60", path],
-           stderr_to_stdout: true
-         ) do
+  defp http_get(opts) do
+    {max_retries, opts} = Keyword.pop(opts, :max_retries, 3)
+
+    [
+      headers: @headers,
+      finch: @finch_name,
+      retry: :transient,
+      max_retries: max_retries,
+      receive_timeout: 30_000
+    ]
+    |> Keyword.merge(opts)
+    |> Req.get()
+  end
+
+  defp maybe_optimize(_tmp_dir, false), do: :ok
+
+  defp maybe_optimize(tmp_dir, true) do
+    files =
+      tmp_dir
+      |> File.ls!()
+      |> Enum.sort()
+      |> Enum.map(&Path.join(tmp_dir, &1))
+
+    args = ["mogrify", "-colorspace", "Gray", "-strip", "-quality", "60"] ++ files
+
+    case System.cmd("magick", args, stderr_to_stdout: true) do
       {_, 0} -> :ok
-      {output, _} -> {:error, "magick optimize failed: #{output}"}
+      {output, _} -> {:error, "magick mogrify failed: #{output}"}
     end
   end
 
@@ -284,6 +280,23 @@ defmodule HxhPdf do
       {:error, reason} ->
         File.rm(tmp_output)
         {:error, "zip failed: #{inspect(reason)}"}
+    end
+  end
+
+  defp chapter_url(407), do: "#{@base_url}/hunter-x-hunter-chapter-407-2/"
+  defp chapter_url(n), do: "#{@base_url}/hunter-x-hunter-chapter-#{n}/"
+
+  defp output_path(chapter) do
+    padded = chapter |> Integer.to_string() |> String.pad_leading(3, "0")
+    Path.join(@output_dir, "Hunter_x_Hunter_#{padded}.cbz")
+  end
+
+  defp url_extension(url) do
+    uri = URI.parse(url)
+
+    case Path.extname(uri.path || "") do
+      "" -> ".jpg"
+      ext -> ext
     end
   end
 

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "vault-kit": {
+      "command": "bun",
+      "args": ["/home/user/Work/obsidian_ai_tools/dist/index.js"],
+      "env": {
+        "VAULT_PATH": "/home/user/Dropbox/notes"
+      }
+    }
+  }
+}
