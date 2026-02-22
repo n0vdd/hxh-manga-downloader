@@ -30,8 +30,6 @@ defmodule HxhPdf do
     * `--from N` — first chapter to download (default: 1)
     * `--to N` — last chapter to download (default: #{@last_chapter})
     * `--no-optimize` — skip ImageMagick grayscale/strip/quality reduction
-    * `--chapters N` — max concurrent chapters (default: #{@default_chapters})
-    * `--images N` — max concurrent image downloads per chapter (default: #{@default_images})
   """
   def main(args \\ System.argv()) do
     {opts, _, _} =
@@ -39,23 +37,19 @@ defmodule HxhPdf do
         strict: [
           from: :integer,
           to: :integer,
-          optimize: :boolean,
-          chapters: :integer,
-          images: :integer
+          optimize: :boolean
         ]
       )
 
     from = Keyword.get(opts, :from, 1)
     to = Keyword.get(opts, :to, @last_chapter)
     optimize? = Keyword.get(opts, :optimize, true)
-    max_chapters = Keyword.get(opts, :chapters, @default_chapters)
-    max_images = Keyword.get(opts, :images, @default_images)
 
     Finch.start_link(
       name: @finch_name,
       pools: %{
         default: [
-          size: max_chapters * max_images + max_chapters,
+          size: @default_chapters * @default_images + @default_chapters,
           count: System.schedulers_online(),
           conn_opts: [transport_opts: [timeout: 15_000]]
         ]
@@ -80,24 +74,22 @@ defmodule HxhPdf do
     if pending == [] do
       IO.puts("Nothing to download.")
     else
-      IO.puts(
-        "Downloading #{total} chapters as cbz#{opt_label} (concurrency: #{max_chapters} chapters, #{max_images} images)"
-      )
+      IO.puts("Downloading #{total} chapters as cbz#{opt_label}")
 
       start_time = System.monotonic_time(:millisecond)
 
-      run_chapters(pending, optimize?, total, max_chapters, max_images)
+      run_chapters(pending, optimize?, total)
 
       elapsed_s = (System.monotonic_time(:millisecond) - start_time) / 1_000
       IO.puts("\nElapsed: #{Float.round(elapsed_s, 1)}s | Done!")
     end
   end
 
-  defp run_chapters(chapters, optimize?, total, max_chapters, max_images) do
+  defp run_chapters(chapters, optimize?, total) do
     chapters
     |> Task.async_stream(
-      fn chapter -> timed_process_chapter(chapter, optimize?, max_images) end,
-      max_concurrency: max_chapters,
+      fn chapter -> process_chapter(chapter, optimize?) end,
+      max_concurrency: @default_chapters,
       ordered: false,
       timeout: :infinity
     )
@@ -108,17 +100,35 @@ defmodule HxhPdf do
     end)
   end
 
-  defp timed_process_chapter(chapter, optimize?, max_images) do
-    start = System.monotonic_time(:millisecond)
-    result = process_chapter(chapter, optimize?, max_images)
-    elapsed = (System.monotonic_time(:millisecond) - start) / 1_000
-    {result, elapsed}
+  defp process_chapter(chapter, optimize?) do
+    start_time = System.monotonic_time(:millisecond)
+
+    tmp_dir =
+      Path.join(System.tmp_dir!(), "hxh_ch#{chapter}_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(tmp_dir)
+
+    result =
+      with {:ok, image_urls} <- scrape_chapter(chapter),
+           :ok <- download_images(image_urls, tmp_dir),
+           :ok <- maybe_optimize(tmp_dir, optimize?),
+           :ok <- create_archive(tmp_dir, output_path(chapter)) do
+        elapsed = (System.monotonic_time(:millisecond) - start_time) / 1_000
+        {:ok, chapter, elapsed}
+      else
+        {:error, reason} ->
+          elapsed = (System.monotonic_time(:millisecond) - start_time) / 1_000
+          {:error, chapter, reason, elapsed}
+      end
+
+    File.rm_rf(tmp_dir)
+    result
   end
 
-  defp report_result({:ok, {{:ok, chapter}, elapsed}}, done, total),
+  defp report_result({:ok, {:ok, chapter, elapsed}}, done, total),
     do: IO.puts("[OK] Chapter #{chapter} in #{Float.round(elapsed, 1)}s (#{done}/#{total})")
 
-  defp report_result({:ok, {{:error, chapter, reason}, elapsed}}, done, total),
+  defp report_result({:ok, {:error, chapter, reason, elapsed}}, done, total),
     do:
       IO.puts(
         "[ERROR] Chapter #{chapter}: #{inspect(reason)} after #{Float.round(elapsed, 1)}s (#{done}/#{total})"
@@ -130,28 +140,6 @@ defmodule HxhPdf do
   defp partition_chapters(chapters) do
     {skipped, pending} = Enum.split_with(chapters, &File.exists?(output_path(&1)))
     {skipped, pending}
-  end
-
-  defp process_chapter(chapter, optimize?, max_images) do
-    output_file = output_path(chapter)
-
-    tmp_dir =
-      Path.join(System.tmp_dir!(), "hxh_ch#{chapter}_#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(tmp_dir)
-
-    try do
-      with {:ok, image_urls} <- scrape_chapter(chapter),
-           :ok <- download_images(image_urls, tmp_dir, max_images),
-           :ok <- maybe_optimize(tmp_dir, optimize?),
-           :ok <- create_archive(tmp_dir, output_file) do
-        {:ok, chapter}
-      else
-        {:error, reason} -> {:error, chapter, reason}
-      end
-    after
-      File.rm_rf!(tmp_dir)
-    end
   end
 
   defp scrape_chapter(chapter) do
@@ -195,11 +183,11 @@ defmodule HxhPdf do
     "no images found for chapter #{chapter} | <img>: #{img_count}, <a>: #{a_count} | entry-content preview: #{entry_html}"
   end
 
-  defp download_images(urls, tmp_dir, max_images) do
+  defp download_images(urls, tmp_dir) do
     urls
     |> Enum.with_index(1)
     |> Task.async_stream(&download_one(&1, tmp_dir),
-      max_concurrency: max_images,
+      max_concurrency: @default_images,
       timeout: :infinity
     )
     |> Enum.reduce_while(:ok, fn
