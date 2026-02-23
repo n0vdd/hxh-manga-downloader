@@ -1,11 +1,10 @@
 defmodule HxhPdf do
   @moduledoc """
-  CLI escript that scrapes Hunter x Hunter manga chapters from w19.read-hxh.com
+  CLI release that scrapes Hunter x Hunter manga chapters from w19.read-hxh.com
   and packages them as CBZ archives.
 
   Pipeline per chapter: check if CBZ exists (skip) → scrape image URLs from HTML
-  → download images to temp dir → optionally optimize with ImageMagick → create
-  CBZ via Erlang `:zip` → cleanup temp dir.
+  → download images to temp dir → create CBZ via Erlang `:zip` → cleanup temp dir.
 
   Output goes to `./output/` as `Hunter_x_Hunter_XXX.cbz`.
   """
@@ -23,34 +22,34 @@ defmodule HxhPdf do
   ]
 
   @doc """
-  Entry point for the escript.
+  Entry point for the release CLI.
 
   ## Options
 
     * `--from N` — first chapter to download (default: 1)
     * `--to N` — last chapter to download (default: #{@last_chapter})
-    * `--no-optimize` — skip ImageMagick grayscale/strip/quality reduction
   """
+  @spec main([String.t()]) :: :ok
   def main(args \\ System.argv()) do
+    {:ok, _} = Application.ensure_all_started(:hxh_pdf)
+
     {opts, _, _} =
       OptionParser.parse(args,
         strict: [
           from: :integer,
-          to: :integer,
-          optimize: :boolean
+          to: :integer
         ]
       )
 
     from = Keyword.get(opts, :from, 1)
     to = Keyword.get(opts, :to, @last_chapter)
-    optimize? = Keyword.get(opts, :optimize, true)
 
     Finch.start_link(
       name: @finch_name,
       pools: %{
         default: [
           size: @default_chapters * @default_images + @default_chapters,
-          count: System.schedulers_online(),
+          count: 1,
           conn_opts: [transport_opts: [timeout: 15_000]]
         ]
       }
@@ -63,8 +62,6 @@ defmodule HxhPdf do
     chapters = Enum.to_list(from..to)
     {skipped, pending} = partition_chapters(chapters)
 
-    opt_label = if optimize?, do: ", optimized", else: ""
-
     if skipped != [] do
       IO.puts("[SKIP] #{length(skipped)} chapters already exist")
     end
@@ -74,21 +71,21 @@ defmodule HxhPdf do
     if pending == [] do
       IO.puts("Nothing to download.")
     else
-      IO.puts("Downloading #{total} chapters as cbz#{opt_label}")
+      IO.puts("Downloading #{total} chapters as cbz")
 
       start_time = System.monotonic_time(:millisecond)
 
-      run_chapters(pending, optimize?, total)
+      run_chapters(pending, total)
 
       elapsed_s = (System.monotonic_time(:millisecond) - start_time) / 1_000
       IO.puts("\nElapsed: #{Float.round(elapsed_s, 1)}s | Done!")
     end
   end
 
-  defp run_chapters(chapters, optimize?, total) do
+  defp run_chapters(chapters, total) do
     chapters
     |> Task.async_stream(
-      fn chapter -> process_chapter(chapter, optimize?) end,
+      fn chapter -> process_chapter(chapter) end,
       max_concurrency: @default_chapters,
       ordered: false,
       timeout: :infinity
@@ -100,7 +97,9 @@ defmodule HxhPdf do
     end)
   end
 
-  defp process_chapter(chapter, optimize?) do
+  @spec process_chapter(pos_integer()) ::
+          {:ok, pos_integer(), float()} | {:error, pos_integer(), term(), float()}
+  defp process_chapter(chapter) do
     start_time = System.monotonic_time(:millisecond)
 
     tmp_dir =
@@ -111,7 +110,6 @@ defmodule HxhPdf do
     result =
       with {:ok, image_urls} <- scrape_chapter(chapter),
            :ok <- download_images(image_urls, tmp_dir),
-           :ok <- maybe_optimize(tmp_dir, optimize?),
            :ok <- create_archive(tmp_dir, output_path(chapter)) do
         elapsed = (System.monotonic_time(:millisecond) - start_time) / 1_000
         {:ok, chapter, elapsed}
@@ -138,15 +136,15 @@ defmodule HxhPdf do
     do: IO.puts("[EXIT] Task crashed: #{inspect(reason)} (#{done}/#{total})")
 
   defp partition_chapters(chapters) do
-    {skipped, pending} = Enum.split_with(chapters, &File.exists?(output_path(&1)))
-    {skipped, pending}
+    Enum.split_with(chapters, &File.exists?(output_path(&1)))
   end
 
+  @spec scrape_chapter(pos_integer()) :: {:ok, [String.t()]} | {:error, term()}
   defp scrape_chapter(chapter) do
     url = chapter_url(chapter)
 
-    with {:ok, %{status: 200, body: body}} <- http_get(url: url, max_retries: 3),
-         {:ok, doc} <- Floki.parse_document(body) do
+    with {:ok, %{status: 200, body: body}} <- http_get(url, max_retries: 3),
+         {:ok, doc} <- Floki.parse_document(body, html_parser: Floki.HTMLParser.FastHtml) do
       case extract_image_urls(doc) do
         [] -> {:error, no_images_diagnostic(doc, chapter)}
         urls -> {:ok, urls}
@@ -158,31 +156,63 @@ defmodule HxhPdf do
   end
 
   defp extract_image_urls(doc) do
-    case doc |> Floki.find(".entry-content a[href*='blogger']") |> Floki.attribute("href") do
-      [] ->
-        doc
-        |> Floki.find(".entry-content img[src*='laiond']")
-        |> Floki.attribute("src")
+    alias HxhPdf.Selectors
+
+    Selectors.image_tiers()
+    |> Enum.find_value(fn tier ->
+      urls =
+        run_tier(doc, tier)
+        |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "data:")))
+        |> maybe_filter(tier[:filter])
         |> Enum.uniq()
 
-      urls ->
-        Enum.uniq(urls)
-    end
+      if urls != [], do: Enum.map(urls, &upgrade_blogger_resolution/1)
+    end) || []
+  end
+
+  defp maybe_filter(urls, true), do: Enum.filter(urls, &manga_image?/1)
+  defp maybe_filter(urls, _), do: urls
+
+  defp run_tier(doc, %{extract: {:attr, attr}} = tier) do
+    doc |> Floki.find(tier.selector) |> Floki.attribute(attr)
+  end
+
+  @doc false
+  def upgrade_blogger_resolution(url) do
+    String.replace(
+      url,
+      HxhPdf.Selectors.blogger_resolution_pattern(),
+      HxhPdf.Selectors.blogger_target_resolution()
+    )
+  end
+
+  @doc false
+  def manga_image?(url) do
+    not Enum.any?(HxhPdf.Selectors.non_content_patterns(), &String.contains?(url, &1)) and
+      has_image_ext_or_cdn?(url)
+  end
+
+  @doc false
+  def has_image_ext_or_cdn?(url) do
+    Enum.any?(HxhPdf.Selectors.cdn_domains(), &String.contains?(url, &1)) or
+      Regex.match?(HxhPdf.Selectors.image_ext_regex(), url)
   end
 
   defp no_images_diagnostic(doc, chapter) do
-    img_count = doc |> Floki.find("img") |> length()
-    a_count = doc |> Floki.find("a") |> length()
+    diag = HxhPdf.Selectors.diagnostic()
+    img_count = doc |> Floki.find(diag.all_images) |> length()
+    a_count = doc |> Floki.find(diag.all_links) |> length()
 
     entry_html =
-      case Floki.find(doc, ".entry-content") do
-        [] -> "(no .entry-content found)"
+      case Floki.find(doc, diag.entry_content) do
+        [] -> "(no #{diag.entry_content} found)"
         nodes -> nodes |> Floki.raw_html() |> String.slice(0, 500)
       end
 
     "no images found for chapter #{chapter} | <img>: #{img_count}, <a>: #{a_count} | entry-content preview: #{entry_html}"
   end
 
+  @spec download_images([String.t()], Path.t()) :: :ok | {:error, term()}
   defp download_images(urls, tmp_dir) do
     urls
     |> Enum.with_index(1)
@@ -205,7 +235,7 @@ defmodule HxhPdf do
   end
 
   defp download_image(url, dest) do
-    case http_get(url: url, max_retries: 5) do
+    case http_get(url, max_retries: 5) do
       {:ok, %{status: 200, body: body}} ->
         File.write!(dest, body)
         :ok
@@ -218,37 +248,20 @@ defmodule HxhPdf do
     end
   end
 
-  defp http_get(opts) do
-    {max_retries, opts} = Keyword.pop(opts, :max_retries, 3)
+  @spec http_get(String.t(), keyword()) :: {:ok, Req.Response.t()} | {:error, term()}
+  defp http_get(url, opts) do
+    max_retries = Keyword.get(opts, :max_retries, 3)
 
-    [
+    Req.get(url,
       headers: @headers,
       finch: @finch_name,
       retry: :transient,
       max_retries: max_retries,
       receive_timeout: 30_000
-    ]
-    |> Keyword.merge(opts)
-    |> Req.get()
+    )
   end
 
-  defp maybe_optimize(_tmp_dir, false), do: :ok
-
-  defp maybe_optimize(tmp_dir, true) do
-    files =
-      tmp_dir
-      |> File.ls!()
-      |> Enum.sort()
-      |> Enum.map(&Path.join(tmp_dir, &1))
-
-    args = ["mogrify", "-colorspace", "Gray", "-strip", "-quality", "60"] ++ files
-
-    case System.cmd("magick", args, stderr_to_stdout: true) do
-      {_, 0} -> :ok
-      {output, _} -> {:error, "magick mogrify failed: #{output}"}
-    end
-  end
-
+  @spec create_archive(Path.t(), Path.t()) :: :ok | {:error, String.t()}
   defp create_archive(tmp_dir, output_file) do
     tmp_output = output_file <> ".tmp"
 
@@ -271,15 +284,18 @@ defmodule HxhPdf do
     end
   end
 
-  defp chapter_url(407), do: "#{@base_url}/hunter-x-hunter-chapter-407-2/"
-  defp chapter_url(n), do: "#{@base_url}/hunter-x-hunter-chapter-#{n}/"
+  @doc false
+  def chapter_url(407), do: "#{@base_url}/hunter-x-hunter-chapter-407-2/"
+  def chapter_url(n), do: "#{@base_url}/hunter-x-hunter-chapter-#{n}/"
 
-  defp output_path(chapter) do
+  @doc false
+  def output_path(chapter) do
     padded = chapter |> Integer.to_string() |> String.pad_leading(3, "0")
     Path.join(@output_dir, "Hunter_x_Hunter_#{padded}.cbz")
   end
 
-  defp url_extension(url) do
+  @doc false
+  def url_extension(url) do
     uri = URI.parse(url)
 
     case Path.extname(uri.path || "") do

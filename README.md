@@ -1,30 +1,28 @@
 # hxh-manga-downloader
 
-Elixir CLI tool that scrapes Hunter x Hunter manga chapters from the web and packages them as CBZ archives. Optionally optimizes images via ImageMagick (grayscale, strip metadata, reduce quality).
+Elixir CLI tool that scrapes Hunter x Hunter manga chapters from w19.read-hxh.com and packages them as CBZ archives with original full-resolution images.
 
 ## Requirements
 
 - Elixir 1.15+ / Erlang OTP
-- ImageMagick (`magick` command) — only needed for image optimization
+- C compiler + `make` (needed by `fast_html` NIF)
 
 ## Build
 
 ```bash
 mix deps.get
-mix escript.build
+MIX_ENV=prod mix release
+mix test                    # run tests
 ```
 
 ## Usage
 
 ```bash
 # Download all 412 chapters (default)
-./hxh_pdf
+_build/prod/rel/hxh_pdf/bin/hxh
 
 # Download a specific range
-./hxh_pdf --from 1 --to 10
-
-# Skip image optimization
-./hxh_pdf --from 50 --to 100 --no-optimize
+_build/prod/rel/hxh_pdf/bin/hxh --from 1 --to 10
 ```
 
 ### CLI flags
@@ -33,19 +31,19 @@ mix escript.build
 |------|---------|-------------|
 | `--from N` | 1 | First chapter to download |
 | `--to N` | 412 | Last chapter to download |
-| `--no-optimize` | (optimize on) | Skip ImageMagick grayscale/strip/quality reduction |
 
 Output goes to `./output/` as `Hunter_x_Hunter_XXX.cbz`. Existing chapters are skipped automatically.
 
 ## Architecture
 
-Single module (`HxhPdf` in `lib/hxh_pdf.ex`):
+Two modules:
 
-- Processes 4 chapters concurrently via `Task.async_stream`, each downloading up to 6 images concurrently
-- Finch connection pool sized at 28 (`4 * 6 + 4`)
-- Uses [Floki](https://github.com/philss/floki) for HTML parsing and [Req](https://github.com/wojtekmach/req) + Finch for HTTP with transient retries
+- **`HxhPdf`** (`lib/hxh_pdf.ex`) — Entry point (`main/1`), argument parsing, scraping, image downloading, and CBZ creation.
+- **`HxhPdf.Selectors`** (`lib/hxh_pdf/selectors.ex`) — Site-specific CSS selectors, CDN patterns, and image-filtering heuristics.
 
-**Pipeline per chapter:** check if CBZ exists (skip) → scrape image URLs from HTML → download images to temp dir → optionally optimize with ImageMagick → create CBZ via Erlang `:zip` → cleanup temp dir.
+Processes 4 chapters concurrently via `Task.async_stream`, each downloading up to 6 images concurrently. Finch connection pool sized at 28 (`4 * 6 + 4`). Uses [Floki](https://github.com/philss/floki) (with FastHtml backend) for HTML parsing and [Req](https://github.com/wojtekmach/req) + Finch for HTTP with transient retries.
+
+**Pipeline per chapter:** check if CBZ exists (skip) → scrape image URLs from HTML → download images to temp dir → create CBZ via Erlang `:zip` → cleanup temp dir.
 
 ## Performance
 

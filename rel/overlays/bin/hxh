@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+SELF=$(readlink -f "$0" 2>/dev/null || realpath "$0")
+exec "$(dirname "$SELF")/hxh_pdf" eval 'HxhPdf.main(System.argv())' "$@"

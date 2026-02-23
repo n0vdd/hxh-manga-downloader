@@ -7,7 +7,7 @@ defmodule HxhPdf.MixProject do
       version: "0.1.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
-      escript: [main_module: HxhPdf],
+      releases: [hxh_pdf: [strip_beams: true]],
       deps: deps()
     ]
   end
@@ -22,6 +22,7 @@ defmodule HxhPdf.MixProject do
     [
       {:req, "~> 0.5.17"},
       {:floki, "~> 0.38.0"},
+      {:fast_html, "~> 2.3"},
       {:credo, "~> 1.7", only: [:dev], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
