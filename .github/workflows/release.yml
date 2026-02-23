@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Erlang/Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      - name: Install dependencies
+        run: mix deps.get --only prod
+
+      - name: Build release
+        env:
+          MIX_ENV: prod
+        run: mix release
+
+      - name: Create tarball
+        run: tar -czf hxh-manga-downloader-linux-x86_64.tar.gz -C _build/prod/rel/hxh_pdf .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: hxh-manga-downloader-linux-x86_64.tar.gz
+          body: |
+            > **Experimental release** — this is a pre-release build. Use at your own risk.
+
+            ## Download
+
+            Self-contained Linux x86_64 binary (includes Erlang runtime, no dependencies needed).
+
+            ```bash
+            tar -xzf hxh-manga-downloader-linux-x86_64.tar.gz -C hxh-manga-downloader
+            cd hxh-manga-downloader
+            ./bin/hxh --from 1 --to 10
+            ```
+
+            Output goes to `./output/` as `Hunter_x_Hunter_XXX.cbz`.

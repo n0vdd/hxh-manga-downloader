@@ -2,6 +2,16 @@
 
 Elixir CLI tool that scrapes Hunter x Hunter manga chapters from w19.read-hxh.com and packages them as CBZ archives with original full-resolution images.
 
+## Download (experimental)
+
+Pre-built Linux x86_64 binaries are available on the [Releases](../../releases) page. These are self-contained and include the Erlang runtime — no dependencies needed.
+
+```bash
+tar -xzf hxh-manga-downloader-linux-x86_64.tar.gz -C hxh-manga-downloader
+cd hxh-manga-downloader
+./bin/hxh --from 1 --to 10
+```
+
 ## Requirements
 
 - Elixir 1.15+ / Erlang OTP
