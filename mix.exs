@@ -8,6 +8,8 @@ defmodule HxhPdf.MixProject do
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       releases: [hxh_pdf: [strip_beams: true]],
+      description: "HxH manga chapter scraper and CBZ archiver",
+      package: [licenses: ["GPL-3.0-or-later"]],
       deps: deps()
     ]
   end

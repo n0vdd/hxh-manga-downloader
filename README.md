@@ -58,3 +58,7 @@ Processes 4 chapters concurrently via `Task.async_stream`, each downloading up t
 ## Performance
 
 Throughput is ~10s/chapter, bottlenecked by the upstream server. Increasing concurrency beyond the current defaults doesn't help.
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
